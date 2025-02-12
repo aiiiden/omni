@@ -117,7 +117,7 @@ interface ISolverNetInbox is IOriginSettler {
     /**
      * @notice Returns the next order ID.
      */
-    function getNextId() external view returns (bytes32);
+    function getNextId(address owner) external view returns (bytes32);
 
     /**
      * @notice Returns the latest order with the given status.

@@ -6,6 +6,7 @@ import (
 	"github.com/omni-network/omni/lib/contracts/solvernet/inbox"
 	"github.com/omni-network/omni/lib/contracts/solvernet/middleman"
 	"github.com/omni-network/omni/lib/contracts/solvernet/outbox"
+	"github.com/omni-network/omni/lib/contracts/solvernet/xaccount"
 	"github.com/omni-network/omni/lib/errors"
 	"github.com/omni-network/omni/lib/ethclient/ethbackend"
 	"github.com/omni-network/omni/lib/log"
@@ -58,6 +59,13 @@ func deployBoxes(ctx context.Context, network netconf.Network, backends ethbacke
 			}
 
 			log.Info(ctx, "SolverNetMiddleman deployed", "addr", addr.Hex(), "chain", chain.Name, "tx", maybeTxHash(receipt))
+
+			addr, receipt, err = xaccount.Deploy(ctx, network, backend)
+			if err != nil {
+				return errors.Wrap(err, "deploy solve xaccount", "chain", chain.Name)
+			}
+
+			log.Info(ctx, "XAccount deployed", "addr", addr.Hex(), "chain", chain.Name, "tx", maybeTxHash(receipt))
 
 			return nil
 		})

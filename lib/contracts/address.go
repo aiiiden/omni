@@ -30,6 +30,7 @@ const (
 	NameSolverNetInbox     = "solvernet-inbox"
 	NameSolverNetOutbox    = "solvernet-outbox"
 	NameSolverNetMiddleman = "solvernet-middleman"
+	NameXAccount           = "xaccount"
 	NameFeeOracleV2        = "fee-oracle-v2"
 )
 
@@ -99,6 +100,7 @@ type Addresses struct {
 	SolverNetInbox     common.Address
 	SolverNetOutbox    common.Address
 	SolverNetMiddleman common.Address
+	XAccount           common.Address
 	FeeOracleV2        common.Address
 }
 
@@ -112,6 +114,7 @@ type Salts struct {
 	SolverNetInbox     string
 	SolverNetOutbox    string
 	SolverNetMiddleman string
+	XAccount           string
 	FeeOracleV2        string
 }
 
@@ -166,6 +169,7 @@ func GetAddresses(ctx context.Context, network netconf.ID) (Addresses, error) {
 		SolverNetInbox:     addr(network, s(NameSolverNetInbox)),
 		SolverNetOutbox:    addr(network, s(NameSolverNetOutbox)),
 		SolverNetMiddleman: addr(network, s(NameSolverNetMiddleman)),
+		XAccount:           addr(network, s(NameXAccount)),
 		FeeOracleV2:        addr(network, s(NameFeeOracleV2)),
 	}
 
@@ -207,6 +211,7 @@ func GetSalts(ctx context.Context, network netconf.ID) (Salts, error) {
 		SolverNetInbox:     s(NameSolverNetInbox),
 		SolverNetOutbox:    s(NameSolverNetOutbox),
 		SolverNetMiddleman: s(NameSolverNetMiddleman),
+		XAccount:           s(NameXAccount),
 		FeeOracleV2:        s(NameFeeOracleV2),
 	}
 

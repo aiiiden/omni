@@ -34,9 +34,9 @@ contract SolverNetInbox is OwnableRoles, ReentrancyGuard, Initializable, Deploye
     );
 
     /**
-     * @dev Counter for generating unique order IDs. Incremented each time a new order is created.
+     * @dev Map user to order nonce (by owner, not creator)
      */
-    uint256 internal _lastId;
+    mapping(address owner => uint256 nonce) internal _nonces;
 
     /**
      * @notice Addresses of the outbox contracts.
@@ -122,8 +122,8 @@ contract SolverNetInbox is OwnableRoles, ReentrancyGuard, Initializable, Deploye
     /**
      * @notice Returns the next order ID.
      */
-    function getNextId() external view returns (bytes32) {
-        return _nextId();
+    function getNextId(address owner) external view returns (bytes32) {
+        return _nextId(owner);
     }
 
     /**
@@ -149,7 +149,7 @@ contract SolverNetInbox is OwnableRoles, ReentrancyGuard, Initializable, Deploye
      */
     function resolve(OnchainCrossChainOrder calldata order) public view returns (ResolvedCrossChainOrder memory) {
         SolverNet.Order memory orderData = _validate(order);
-        return _resolve(orderData, _nextId());
+        return _resolve(orderData, _nextId(orderData.header.owner));
     }
 
     /**
@@ -447,7 +447,7 @@ contract SolverNetInbox is OwnableRoles, ReentrancyGuard, Initializable, Deploye
      * @param orderData Order data to open.
      */
     function _openOrder(SolverNet.Order memory orderData) internal returns (ResolvedCrossChainOrder memory resolved) {
-        bytes32 id = _incrementId();
+        bytes32 id = _incrementId(orderData.header.owner);
         resolved = _resolve(orderData, id);
 
         _orderHeader[id] = orderData.header;
@@ -499,15 +499,23 @@ contract SolverNetInbox is OwnableRoles, ReentrancyGuard, Initializable, Deploye
     /**
      * @dev Return the next order ID.
      */
-    function _nextId() internal view returns (bytes32) {
-        return bytes32(_lastId + 1);
+    function _nextId(address _owner) internal view returns (bytes32) {
+        return _id(_owner, _nonces[_owner] + 1);
     }
 
     /**
      * @dev Increment and return the next order ID.
      */
-    function _incrementId() internal returns (bytes32) {
-        return bytes32(++_lastId);
+    function _incrementId(address _owner) internal returns (bytes32) {
+        return _id(_owner, ++_nonces[_owner]);
+    }
+
+    /**
+     * @dev Return the order ID for `owner` and `nonce`
+     *      Include chain ID so that IDs are globally unique.
+     */
+    function _id(address owner, uint256 nonce) internal view returns (bytes32) {
+        return keccak256(abi.encode(owner, nonce, block.chainid));
     }
 
     /**
