@@ -2,11 +2,11 @@
 pragma solidity =0.8.24;
 
 import { TransparentUpgradeableProxy } from "@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol";
-import { SolverNetInbox } from "src/SolverNetInbox.sol";
+import { SolverNetInboxV2 } from "src/SolverNetInboxV2.sol";
 import { SolverNetOutbox } from "src/SolverNetOutbox.sol";
 import { SolverNetMiddleman } from "src/SolverNetMiddleman.sol";
 import { SolverNetExecutor } from "src/SolverNetExecutor.sol";
-import { ISolverNetInbox } from "src/interfaces/ISolverNetInbox.sol";
+import { ISolverNetInboxV2 } from "src/interfaces/ISolverNetInboxV2.sol";
 import { ISolverNetOutbox } from "src/interfaces/ISolverNetOutbox.sol";
 
 import { IERC20 } from "@openzeppelin/contracts/interfaces/IERC20.sol";
@@ -14,24 +14,26 @@ import { MockERC20 } from "test/utils/MockERC20.sol";
 import { MockVault } from "test/utils/MockVault.sol";
 import { MockMultiTokenVault } from "test/utils/MockMultiTokenVault.sol";
 import { MockPortal } from "core/test/utils/MockPortal.sol";
-
+import { IPermit2, ISignatureTransfer } from "@uniswap/permit2/src/interfaces/IPermit2.sol";
 import { IERC7683 } from "src/erc7683/IERC7683.sol";
 import { SolverNet } from "src/lib/SolverNet.sol";
+import { HashLib } from "src/lib/HashLib.sol";
 
 import { Test, console2 } from "forge-std/Test.sol";
+import { TestStorage } from "./TestStorage.sol";
 import { Ownable } from "solady/src/auth/Ownable.sol";
 import { FixedPointMathLib } from "solady/src/utils/FixedPointMathLib.sol";
 import { AddrUtils } from "src/lib/AddrUtils.sol";
 
 /**
- * @title TestBase
+ * @title TestBaseV2
  * @dev Shared test utils / fixtures.
  */
-contract TestBase is Test {
+contract TestBaseV2 is Test, TestStorage {
     using AddrUtils for address;
     using AddrUtils for bytes32;
 
-    SolverNetInbox inbox;
+    SolverNetInboxV2 inbox;
     SolverNetOutbox outbox;
     SolverNetMiddleman middleman;
     SolverNetExecutor executor;
@@ -44,11 +46,14 @@ contract TestBase is Test {
     MockMultiTokenVault multiTokenVault;
 
     MockPortal portal;
+    IPermit2 permit2;
 
     uint64 srcChainId = 1;
     uint64 destChainId = 2;
 
-    address user = makeAddr("user");
+    address user;
+    uint256 userPk;
+
     address solver = makeAddr("solver");
     address proxyAdmin = makeAddr("proxy-admin-owner");
 
@@ -56,8 +61,14 @@ contract TestBase is Test {
     uint32 defaultFillDeadline = uint32(block.timestamp + 1 hours);
     uint32 defaultFillBuffer = 6 hours;
 
+    address internal constant PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
+
     bytes32 internal constant ORDERDATA_TYPEHASH = keccak256(
         "OrderData(address owner,uint64 destChainId,Deposit deposit,Call[] calls,TokenExpense[] expenses)Deposit(address token,uint96 amount)Call(address target,bytes4 selector,uint256 value,bytes params)TokenExpense(address spender,address token,uint96 amount)"
+    );
+
+    bytes32 internal constant OMNIORDERDATA_TYPEHASH = keccak256(
+        "OmniOrderData(address owner,uint64 destChainId,Deposit deposit,Call[] calls,TokenExpense[] expenses)Call(address target,bytes4 selector,uint256 value,bytes params)Deposit(address token,uint96 amount)TokenExpense(address spender,address token,uint96 amount)"
     );
 
     modifier prankUser() {
@@ -67,13 +78,17 @@ contract TestBase is Test {
     }
 
     function setUp() public virtual {
+        (user, userPk) = makeAddrAndKey("user");
+
         token1 = new MockERC20("Token 1", "TKN1");
         token2 = new MockERC20("Token 2", "TKN2");
 
         nativeVault = new MockVault(address(0));
         erc20Vault = new MockVault(address(token2));
         multiTokenVault = new MockMultiTokenVault();
+
         portal = new MockPortal();
+        permit2 = etchPermit2();
 
         inbox = deploySolverNetInbox();
         outbox = deploySolverNetOutbox();
@@ -114,6 +129,21 @@ contract TestBase is Test {
         }
     }
 
+    function fundUser(SolverNet.Deposit memory deposit) internal {
+        address token = deposit.token;
+        uint96 amount = deposit.amount;
+
+        if (amount > 0) {
+            if (token == address(0)) {
+                vm.deal(user, amount);
+            } else {
+                vm.prank(user);
+                MockERC20(token).approve(address(inbox), type(uint256).max);
+                MockERC20(token).mint(user, amount);
+            }
+        }
+    }
+
     function fundSolver(SolverNet.OrderData memory orderData, uint256 fillFees) internal {
         SolverNet.Call[] memory calls = orderData.calls;
         SolverNet.TokenExpense[] memory expenses = orderData.expenses;
@@ -138,6 +168,54 @@ contract TestBase is Test {
         }
     }
 
+    function getPermit2Signature(IERC7683.GaslessCrossChainOrder memory order, SolverNet.OmniOrderData memory orderData)
+        internal
+        view
+        returns (bytes memory)
+    {
+        // Required typehashes for Permit2's permitWitnessTransferFrom
+        bytes32 TOKEN_PERMISSIONS_TYPEHASH = keccak256(bytes(HashLib.TOKEN_PERMISSIONS_TYPE));
+        // Specific typehash for our witness type
+        bytes32 PERMIT_WITNESS_TRANSFER_FROM_TYPEHASH = keccak256(
+            abi.encodePacked(
+                bytes(HashLib.PERMIT_WITNESS_TRANSFER_FROM_TYPE_STUB),
+                bytes(HashLib.PERMIT2_ORDER_TYPE), // The specific witness type string used by SolverNetInboxV2
+                bytes(HashLib.TOKEN_PERMISSIONS_TYPE)
+            )
+        );
+
+        // 1. Calculate order data hash and the witness (full order hash)
+        bytes32 orderDataHash = HashLib.hashOrderData(orderData);
+        bytes32 witness = HashLib.hashGaslessOrder(order, orderDataHash);
+
+        // 2. Calculate Permit2 Domain Separator
+        bytes32 domainSeparator = permit2.DOMAIN_SEPARATOR();
+
+        // 3. Hash the TokenPermissions struct
+        bytes32 hashedTokenPermissions =
+            keccak256(abi.encode(TOKEN_PERMISSIONS_TYPEHASH, orderData.deposit.token, orderData.deposit.amount));
+
+        // 4. Hash the PermitWitnessTransferFrom struct
+        bytes32 structHash = keccak256(
+            abi.encode(
+                PERMIT_WITNESS_TRANSFER_FROM_TYPEHASH,
+                hashedTokenPermissions,
+                address(inbox),
+                order.nonce,
+                order.openDeadline,
+                witness
+            )
+        );
+
+        // 5. Combine domain separator and struct hash according to EIP-712
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
+
+        // 6. Sign the digest
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(userPk, digest);
+
+        return abi.encodePacked(r, s, v);
+    }
+
     function getVaultCall(address vault, uint256 callValue, address depositRecipient, uint256 depositAmount)
         internal
         pure
@@ -159,37 +237,52 @@ contract TestBase is Test {
         return SolverNet.TokenExpense({ spender: spender, token: token, amount: amount });
     }
 
-    function getOrder(uint256 fillDeadline, SolverNet.OrderData memory orderData)
+    function getOnchainOrder(SolverNet.OrderData memory orderData)
         internal
-        pure
+        view
         returns (IERC7683.OnchainCrossChainOrder memory)
     {
         return IERC7683.OnchainCrossChainOrder({
-            fillDeadline: uint32(fillDeadline),
+            fillDeadline: defaultFillDeadline,
             orderDataType: ORDERDATA_TYPEHASH,
             orderData: abi.encode(orderData)
         });
     }
 
-    function getOrder(
+    function getGaslessOrder(uint256 nonce, SolverNet.OmniOrderData memory orderData)
+        internal
+        view
+        returns (IERC7683.GaslessCrossChainOrder memory)
+    {
+        return IERC7683.GaslessCrossChainOrder({
+            originSettler: address(inbox),
+            user: user,
+            nonce: nonce,
+            originChainId: srcChainId,
+            openDeadline: uint32(block.timestamp),
+            fillDeadline: defaultFillDeadline,
+            orderDataType: OMNIORDERDATA_TYPEHASH,
+            orderData: abi.encode(orderData)
+        });
+    }
+
+    function getOnchainOrder(
         address owner,
-        uint64 chainId,
-        uint32 fillDeadline,
         address depositToken,
         uint96 depositAmount,
         SolverNet.Call[] memory calls,
         SolverNet.TokenExpense[] memory expenses
-    ) internal pure returns (SolverNet.OrderData memory, IERC7683.OnchainCrossChainOrder memory) {
+    ) internal view returns (SolverNet.OrderData memory, IERC7683.OnchainCrossChainOrder memory) {
         SolverNet.OrderData memory orderData = SolverNet.OrderData({
             owner: owner,
-            destChainId: chainId,
+            destChainId: destChainId,
             deposit: SolverNet.Deposit({ token: depositToken, amount: depositAmount }),
             calls: calls,
             expenses: expenses
         });
 
         IERC7683.OnchainCrossChainOrder memory order = IERC7683.OnchainCrossChainOrder({
-            fillDeadline: fillDeadline,
+            fillDeadline: defaultFillDeadline,
             orderDataType: ORDERDATA_TYPEHASH,
             orderData: abi.encode(orderData)
         });
@@ -197,12 +290,42 @@ contract TestBase is Test {
         return (orderData, order);
     }
 
-    function getNativeForNativeVaultOrder(uint256 depositAmount, uint256 expenseAmount)
+    function getGaslessOrder(
+        address owner,
+        uint256 nonce,
+        address depositToken,
+        uint96 depositAmount,
+        SolverNet.Call[] memory calls,
+        SolverNet.TokenExpense[] memory expenses
+    ) internal view returns (SolverNet.OmniOrderData memory, IERC7683.GaslessCrossChainOrder memory) {
+        SolverNet.OmniOrderData memory orderData = SolverNet.OmniOrderData({
+            owner: owner,
+            destChainId: destChainId,
+            deposit: SolverNet.Deposit({ token: depositToken, amount: depositAmount }),
+            calls: calls,
+            expenses: expenses
+        });
+
+        IERC7683.GaslessCrossChainOrder memory order = IERC7683.GaslessCrossChainOrder({
+            originSettler: address(inbox),
+            user: user,
+            nonce: nonce,
+            originChainId: srcChainId,
+            openDeadline: uint32(block.timestamp),
+            fillDeadline: defaultFillDeadline,
+            orderDataType: OMNIORDERDATA_TYPEHASH,
+            orderData: abi.encode(orderData)
+        });
+
+        return (orderData, order);
+    }
+
+    function getNativeForNativeVaultOnchainOrder(uint96 depositAmount, uint96 expenseAmount)
         internal
         view
         returns (SolverNet.OrderData memory, IERC7683.OnchainCrossChainOrder memory)
     {
-        SolverNet.Deposit memory deposit = SolverNet.Deposit({ token: address(0), amount: uint96(depositAmount) });
+        SolverNet.Deposit memory deposit = SolverNet.Deposit({ token: address(0), amount: depositAmount });
 
         SolverNet.Call[] memory calls = new SolverNet.Call[](1);
         calls[0] = SolverNet.Call({
@@ -231,12 +354,51 @@ contract TestBase is Test {
         return (orderData, order);
     }
 
-    function getErc20ForErc20VaultOrder(uint256 depositAmount, uint256 expenseAmount)
+    function getNativeForNativeVaultGaslessOrder(uint256 nonce, uint96 depositAmount, uint96 expenseAmount)
+        internal
+        view
+        returns (SolverNet.OmniOrderData memory, IERC7683.GaslessCrossChainOrder memory)
+    {
+        SolverNet.Deposit memory deposit = SolverNet.Deposit({ token: address(0), amount: depositAmount });
+
+        SolverNet.Call[] memory calls = new SolverNet.Call[](1);
+        calls[0] = SolverNet.Call({
+            target: address(nativeVault),
+            selector: MockVault.deposit.selector,
+            value: depositAmount,
+            params: abi.encode(user, expenseAmount)
+        });
+
+        SolverNet.TokenExpense[] memory expenses = new SolverNet.TokenExpense[](0);
+
+        SolverNet.OmniOrderData memory orderData = SolverNet.OmniOrderData({
+            owner: user,
+            destChainId: destChainId,
+            deposit: deposit,
+            calls: calls,
+            expenses: expenses
+        });
+
+        IERC7683.GaslessCrossChainOrder memory order = IERC7683.GaslessCrossChainOrder({
+            originSettler: address(inbox),
+            user: user,
+            nonce: nonce,
+            originChainId: srcChainId,
+            openDeadline: uint32(block.timestamp),
+            fillDeadline: defaultFillDeadline,
+            orderDataType: OMNIORDERDATA_TYPEHASH,
+            orderData: abi.encode(orderData)
+        });
+
+        return (orderData, order);
+    }
+
+    function getErc20ForErc20VaultOnchainOrder(uint96 depositAmount, uint96 expenseAmount)
         internal
         view
         returns (SolverNet.OrderData memory, IERC7683.OnchainCrossChainOrder memory)
     {
-        SolverNet.Deposit memory deposit = SolverNet.Deposit({ token: address(token1), amount: uint96(depositAmount) });
+        SolverNet.Deposit memory deposit = SolverNet.Deposit({ token: address(token1), amount: depositAmount });
 
         SolverNet.Call[] memory calls = new SolverNet.Call[](1);
         calls[0] = SolverNet.Call({
@@ -247,11 +409,8 @@ contract TestBase is Test {
         });
 
         SolverNet.TokenExpense[] memory expenses = new SolverNet.TokenExpense[](1);
-        expenses[0] = SolverNet.TokenExpense({
-            spender: address(erc20Vault),
-            token: address(token2),
-            amount: uint96(expenseAmount)
-        });
+        expenses[0] =
+            SolverNet.TokenExpense({ spender: address(erc20Vault), token: address(token2), amount: expenseAmount });
 
         SolverNet.OrderData memory orderData = SolverNet.OrderData({
             owner: address(0),
@@ -270,7 +429,48 @@ contract TestBase is Test {
         return (orderData, order);
     }
 
-    function getArbitraryVaultOrder(
+    function getErc20ForErc20VaultGaslessOrder(uint256 nonce, uint96 depositAmount, uint96 expenseAmount)
+        internal
+        view
+        returns (SolverNet.OmniOrderData memory, IERC7683.GaslessCrossChainOrder memory)
+    {
+        SolverNet.Deposit memory deposit = SolverNet.Deposit({ token: address(token1), amount: depositAmount });
+
+        SolverNet.Call[] memory calls = new SolverNet.Call[](1);
+        calls[0] = SolverNet.Call({
+            target: address(erc20Vault),
+            selector: MockVault.deposit.selector,
+            value: 0,
+            params: abi.encode(user, expenseAmount)
+        });
+
+        SolverNet.TokenExpense[] memory expenses = new SolverNet.TokenExpense[](1);
+        expenses[0] =
+            SolverNet.TokenExpense({ spender: address(erc20Vault), token: address(token2), amount: expenseAmount });
+
+        SolverNet.OmniOrderData memory orderData = SolverNet.OmniOrderData({
+            owner: user,
+            destChainId: destChainId,
+            deposit: deposit,
+            calls: calls,
+            expenses: expenses
+        });
+
+        IERC7683.GaslessCrossChainOrder memory order = IERC7683.GaslessCrossChainOrder({
+            originSettler: address(inbox),
+            user: user,
+            nonce: nonce,
+            originChainId: srcChainId,
+            openDeadline: uint32(block.timestamp),
+            fillDeadline: defaultFillDeadline,
+            orderDataType: OMNIORDERDATA_TYPEHASH,
+            orderData: abi.encode(orderData)
+        });
+
+        return (orderData, order);
+    }
+
+    function getArbitraryVaultOnchainOrder(
         address depositToken,
         uint96 depositAmount,
         address[] memory expenseTokens,
@@ -327,6 +527,69 @@ contract TestBase is Test {
         return (orderData, order);
     }
 
+    function getArbitraryVaultGaslessOrder(
+        uint256 nonce,
+        address depositToken,
+        uint96 depositAmount,
+        address[] memory expenseTokens,
+        uint96[] memory expenseAmounts
+    ) internal view returns (SolverNet.OmniOrderData memory, IERC7683.GaslessCrossChainOrder memory) {
+        require(expenseTokens.length == expenseAmounts.length, "array length mismatch");
+
+        SolverNet.Deposit memory deposit = SolverNet.Deposit({ token: depositToken, amount: depositAmount });
+
+        SolverNet.Call[] memory calls = new SolverNet.Call[](expenseTokens.length);
+        for (uint256 i; i < expenseTokens.length; ++i) {
+            calls[i] = SolverNet.Call({
+                target: expenseTokens[i] == address(0) ? address(nativeVault) : address(erc20Vault),
+                selector: MockVault.deposit.selector,
+                value: expenseTokens[i] == address(0) ? expenseAmounts[i] : 0,
+                params: abi.encode(user, expenseAmounts[i])
+            });
+        }
+
+        uint256 expenseLength;
+        for (uint256 i; i < expenseTokens.length; ++i) {
+            if (expenseTokens[i] != address(0)) ++expenseLength;
+        }
+
+        uint256 bias;
+        SolverNet.TokenExpense[] memory expenses = new SolverNet.TokenExpense[](expenseLength);
+        for (uint256 i; i < expenseTokens.length; ++i) {
+            if (expenseTokens[i] == address(0)) {
+                ++bias;
+                continue;
+            }
+
+            expenses[i - bias] = SolverNet.TokenExpense({
+                spender: address(erc20Vault),
+                token: expenseTokens[i],
+                amount: expenseAmounts[i]
+            });
+        }
+
+        SolverNet.OmniOrderData memory orderData = SolverNet.OmniOrderData({
+            owner: user,
+            destChainId: destChainId,
+            deposit: deposit,
+            calls: calls,
+            expenses: expenses
+        });
+
+        IERC7683.GaslessCrossChainOrder memory order = IERC7683.GaslessCrossChainOrder({
+            originSettler: address(inbox),
+            user: user,
+            nonce: nonce,
+            originChainId: srcChainId,
+            openDeadline: uint32(block.timestamp),
+            fillDeadline: defaultFillDeadline,
+            orderDataType: OMNIORDERDATA_TYPEHASH,
+            orderData: abi.encode(orderData)
+        });
+
+        return (orderData, order);
+    }
+
     function getGasLimit(bytes memory originData) internal pure returns (uint64) {
         SolverNet.FillOriginData memory fillData = abi.decode(originData, (SolverNet.FillOriginData));
 
@@ -358,9 +621,14 @@ contract TestBase is Test {
 
     // Setup functions
 
-    function deploySolverNetInbox() internal returns (SolverNetInbox) {
-        address impl = address(new SolverNetInbox());
-        return SolverNetInbox(address(new TransparentUpgradeableProxy(impl, proxyAdmin, bytes(""))));
+    function etchPermit2() internal returns (IPermit2) {
+        vm.etch(PERMIT2, PERMIT2_CODE);
+        return IPermit2(PERMIT2);
+    }
+
+    function deploySolverNetInbox() internal returns (SolverNetInboxV2) {
+        address impl = address(new SolverNetInboxV2());
+        return SolverNetInboxV2(address(new TransparentUpgradeableProxy(impl, proxyAdmin, bytes(""))));
     }
 
     function deploySolverNetOutbox() internal returns (SolverNetOutbox) {
@@ -388,17 +656,17 @@ contract TestBase is Test {
         outbox.setInboxes(chainIds, inboxes);
     }
 
-    function assertStatus(bytes32 orderId, ISolverNetInbox.Status status) internal view {
-        (, ISolverNetInbox.OrderState memory state,) = inbox.getOrder(orderId);
+    function assertStatus(bytes32 orderId, ISolverNetInboxV2.Status status) internal view {
+        (, ISolverNetInboxV2.OrderState memory state,) = inbox.getOrder(orderId);
 
         uint8 expect = uint8(status);
         uint8 actual = uint8(state.status);
 
-        if (status == ISolverNetInbox.Status.Pending) assertEq(expect, actual, "order should be pending");
-        if (status == ISolverNetInbox.Status.Claimed) assertEq(expect, actual, "order should be claimed");
-        if (status == ISolverNetInbox.Status.Rejected) assertEq(expect, actual, "order should be rejected");
-        if (status == ISolverNetInbox.Status.Closed) assertEq(expect, actual, "order should be closed");
-        if (status == ISolverNetInbox.Status.Filled) assertEq(expect, actual, "order should be filled");
-        if (status == ISolverNetInbox.Status.Invalid) revert("invalid status");
+        if (status == ISolverNetInboxV2.Status.Pending) assertEq(expect, actual, "order should be pending");
+        if (status == ISolverNetInboxV2.Status.Claimed) assertEq(expect, actual, "order should be claimed");
+        if (status == ISolverNetInboxV2.Status.Rejected) assertEq(expect, actual, "order should be rejected");
+        if (status == ISolverNetInboxV2.Status.Closed) assertEq(expect, actual, "order should be closed");
+        if (status == ISolverNetInboxV2.Status.Filled) assertEq(expect, actual, "order should be filled");
+        if (status == ISolverNetInboxV2.Status.Invalid) revert("invalid status");
     }
 }
